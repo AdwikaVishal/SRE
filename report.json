@@ -1,0 +1,51 @@
+{
+  "adapter": "adapters.engine:Engine",
+  "quick": true,
+  "checks": [
+    {
+      "name": "Ingest throughput",
+      "passed": true,
+      "value": "1260 ev/s",
+      "threshold": "\u2265 1,000 ev/s",
+      "detail": "Ingested 1000 events in 0.794s"
+    },
+    {
+      "name": "Rename robustness (recall@5)",
+      "passed": true,
+      "value": "1 past incidents found",
+      "threshold": "Past incident must appear after rename",
+      "detail": "billing-svc (was payments-svc) \u2192 found inc-99-001: True. Matches: ['inc-99-001']"
+    },
+    {
+      "name": "Temporal ordering",
+      "passed": true,
+      "value": "0 violations",
+      "threshold": "0 violations",
+      "detail": "Checked 1 causal edges"
+    },
+    {
+      "name": "Fast mode p95 latency",
+      "passed": true,
+      "value": "2ms",
+      "threshold": "\u2264 2,000ms",
+      "detail": "p50=1ms, p95=2ms over 10 calls"
+    },
+    {
+      "name": "Context quality",
+      "passed": true,
+      "value": "10 related events, 1 causal edges",
+      "threshold": "Non-empty related_events and explain",
+      "detail": "explain length: 560 chars"
+    },
+    {
+      "name": "Memory evolution",
+      "passed": true,
+      "value": "1 motifs indexed",
+      "threshold": "\u2265 1 motif after resolved remediation",
+      "detail": "Motif index grows when remediation outcome=resolved is ingested"
+    }
+  ],
+  "score": 100.0,
+  "passed": 6,
+  "total": 6
+}
