@@ -1,0 +1,28 @@
+{
+  "adapter": "adapters.engine:Engine",
+  "mode": "fast",
+  "seeds": [
+    42
+  ],
+  "results": [
+    {
+      "seed": 42,
+      "success": true,
+      "latency_ms": 2.37,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    }
+  ],
+  "summary": {
+    "pass_rate": 1.0,
+    "avg_latency_ms": 2.37,
+    "avg_confidence": 0.427,
+    "total_seeds": 1,
+    "passed": 1,
+    "failed": 0
+  }
+}
