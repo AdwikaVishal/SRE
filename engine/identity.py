@@ -12,9 +12,30 @@ RULE: Never store a raw service name in any downstream layer.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from uuid import uuid4
+
+# (canonical_role, name tokens / substrings)
+_ROLE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("checkout", ("checkout", "chk")),
+    ("payment", ("payment", "payments", "pay", "billing", "bil")),
+    ("database", ("database", "postgres", "mysql", "redis", "mongo", "dynamo", "db")),
+    ("gateway", ("gateway", "edge", "router")),
+    ("auth", ("auth", "oauth", "sso", "identity")),
+    ("cache", ("cache", "memcache", "memcached")),
+    ("inventory", ("inventory", "stock", "catalog")),
+    ("notification", ("notification", "notify", "email", "sms")),
+    ("search", ("search", "elastic", "solr")),
+    ("order", ("order", "orders", "cart")),
+    ("api", ("api",)),
+)
+
+_GENERIC_TOKENS = frozenset({
+    "svc", "service", "app", "application", "system", "platform", "worker",
+    "node", "instance", "prod", "staging", "dev", "v1", "v2", "v3",
+})
 
 
 @dataclass
@@ -37,6 +58,7 @@ class IdentityResolver:
     def __init__(self) -> None:
         self._name_to_id: dict[str, str] = {}       # current_name → canonical_id
         self._id_to_names: dict[str, list[str]] = {} # canonical_id → [all names ever]
+        self._role_overrides: dict[str, str] = {}   # canonical_id → canonical_role
         self._rename_log: list[RenameEvent] = []
         self._lock = threading.Lock()
 
@@ -87,6 +109,29 @@ class IdentityResolver:
         """Returns all historical names for a canonical_id."""
         return list(self._id_to_names.get(canonical_id, []))
 
+    def set_canonical_role(self, canonical_id: str, role: str) -> None:
+        """Pin a stable semantic role for a canonical_id (optional override)."""
+        with self._lock:
+            self._role_overrides[canonical_id] = role.strip().lower()
+
+    def canonical_role(self, canonical_id: str) -> str:
+        """
+        Stable semantic role for matching across renames (payment, checkout, …).
+        Derived from all historical service names for the canonical_id.
+        """
+        with self._lock:
+            if canonical_id in self._role_overrides:
+                return self._role_overrides[canonical_id]
+            names = self._id_to_names.get(canonical_id, [])
+            if not names:
+                return "service"
+            roles = [_infer_role_from_name(n) for n in names]
+            specific = [r for r in roles if r != "service"]
+            if specific:
+                # Stable across renames: prefer first registered name's role
+                return specific[0]
+            return roles[0] if roles else "service"
+
     def rename_history(self, canonical_id: str) -> list[RenameEvent]:
         """Returns rename events for a specific canonical_id."""
         return [r for r in self._rename_log if r.canonical_id == canonical_id]
@@ -99,6 +144,7 @@ class IdentityResolver:
         return {
             "name_to_id": self._name_to_id,
             "id_to_names": self._id_to_names,
+            "role_overrides": self._role_overrides,
             "rename_log": [
                 {"old": r.old_name, "new": r.new_name, "ts": r.ts, "cid": r.canonical_id}
                 for r in self._rename_log
@@ -110,6 +156,7 @@ class IdentityResolver:
         resolver = cls()
         resolver._name_to_id = data.get("name_to_id", {})
         resolver._id_to_names = data.get("id_to_names", {})
+        resolver._role_overrides = data.get("role_overrides", {})
         resolver._rename_log = [
             RenameEvent(r["old"], r["new"], r["ts"], r["cid"])
             for r in data.get("rename_log", [])
@@ -136,3 +183,24 @@ class IdentityResolver:
         self._name_to_id[name] = cid
         self._id_to_names[cid] = [name]
         return cid
+
+
+def _infer_role_from_name(name: str) -> str:
+    """Map a service name to a semantic role token (payment, checkout, database, …)."""
+    if not name:
+        return "service"
+    lowered = name.lower()
+    tokens = [t for t in re.split(r"[-_.]+", lowered) if t]
+    haystack = " ".join(tokens)
+
+    for role, keywords in _ROLE_PATTERNS:
+        for kw in keywords:
+            if kw in haystack or kw in lowered:
+                return role
+
+    for token in tokens:
+        if token in _GENERIC_TOKENS or token.isdigit():
+            continue
+        if len(token) >= 3:
+            return token
+    return "service"

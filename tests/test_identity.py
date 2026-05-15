@@ -238,3 +238,23 @@ class TestIdentityResolver:
             t.join()
 
         assert len(set(results)) == 1  # all identical
+
+    # ------------------------------------------------------------------ #
+    # canonical_role()                                                     #
+    # ------------------------------------------------------------------ #
+
+    def test_canonical_role_from_service_name(self):
+        cid = self.resolver.resolve("payments-svc")
+        assert self.resolver.canonical_role(cid) == "payment"
+
+    def test_canonical_role_stable_across_rename(self):
+        cid = self.resolver.resolve("svc-pay-1")
+        assert self.resolver.canonical_role(cid) == "payment"
+        self.resolver.rename("svc-pay-1", "svc-bil-1", "2026-01-01T00:00:00+00:00")
+        assert self.resolver.canonical_role(cid) == "payment"
+
+    def test_canonical_role_checkout_and_database(self):
+        chk = self.resolver.resolve("checkout-api")
+        db = self.resolver.resolve("postgres-db")
+        assert self.resolver.canonical_role(chk) == "checkout"
+        assert self.resolver.canonical_role(db) == "database"

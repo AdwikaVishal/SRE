@@ -13,12 +13,13 @@ This demonstrates to judges that the engine learns and improves over time.
 
 from __future__ import annotations
 
+import pickle
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from engine.graph import IncidentMotif
+from engine.graph import DECAY_FACTOR_PER_24H, IncidentMotif, _periods_24h_since
 
 
 @dataclass
@@ -36,11 +37,15 @@ class IncidentMatch:
 @dataclass
 class StoredMotif:
     """Enhanced motif with memory evolution tracking."""
+
     motif: IncidentMotif
     created_at: str  # ISO timestamp when pattern was first seen
     last_reinforced: Optional[str] = None  # When this pattern was last successful
     confidence: float = 0.6  # Evolved confidence (0.0-1.0)
-    reinforcement_count: int = 0  # How many times this pattern successfully resolved incidents
+    reinforcement_count: int = (
+        0  # How many times this pattern successfully resolved incidents
+    )
+    success_counter: int = 0  # Resolved remediations attributed to this motif
     decay_applied_at: str = ""  # Last time decay was applied
 
 
@@ -65,7 +70,7 @@ class BehavioralMotifIndex:
         self.initial_confidence = 0.6  # New patterns start at 60%
         self.max_confidence = 0.95  # Cap reinforced confidence
         self.min_confidence = 0.1  # Floor for pruning decision
-        self.decay_per_day = 0.02  # Lose 2% confidence per day of age
+        self.decay_factor_per_24h = DECAY_FACTOR_PER_24H  # Exponential decay per 24h
         self.reinforcement_boost = 0.10  # +10% confidence per success
         self.pruning_threshold = 0.15  # Remove if confidence < 15%
         self.max_motifs = 100  # Keep only the top 100 patterns (by confidence)
@@ -74,7 +79,9 @@ class BehavioralMotifIndex:
     # Write - Index & Reinforce
     # ------------------------------------------------------------------
 
-    def index_incident(self, motif: IncidentMotif, timestamp: Optional[str] = None) -> None:
+    def index_incident(
+        self, motif: IncidentMotif, timestamp: Optional[str] = None
+    ) -> None:
         """
         Store a completed incident motif with initial confidence.
 
@@ -100,7 +107,7 @@ class BehavioralMotifIndex:
                 motif=motif,
                 created_at=timestamp,
                 confidence=self.initial_confidence,
-                reinforcement_count=0
+                reinforcement_count=0,
             )
             self._motifs.append(stored)
 
@@ -108,10 +115,7 @@ class BehavioralMotifIndex:
             self._prune_stale_patterns()
 
     def apply_reinforcement(
-        self,
-        incident_id: str,
-        success: bool = True,
-        timestamp: Optional[str] = None
+        self, incident_id: str, success: bool = True, timestamp: Optional[str] = None
     ) -> None:
         """
         MEMORY EVOLUTION: Boost confidence when a pattern successfully resolves.
@@ -128,66 +132,42 @@ class BehavioralMotifIndex:
                 # (In practice, could track match history)
                 if stored.motif.incident_id == incident_id:
                     if success:
-                        # Boost confidence
-                        old_confidence = stored.confidence
                         stored.confidence = min(
                             self.max_confidence,
-                            stored.confidence + self.reinforcement_boost
+                            stored.confidence + self.reinforcement_boost,
                         )
                         stored.reinforcement_count += 1
+                        stored.success_counter += 1
                         stored.last_reinforced = timestamp
                     else:
                         # Failed: confidence decays faster
                         stored.confidence = max(
-                            self.min_confidence,
-                            stored.confidence * 0.8
+                            self.min_confidence, stored.confidence * 0.8
                         )
 
     def apply_decay(self, current_timestamp: Optional[str] = None) -> None:
         """
-        MEMORY EVOLUTION: Age-based confidence decay.
-
-        Older patterns lose confidence gradually. This prevents the engine from
-        relying too heavily on old patterns that may be outdated.
-
-        Pattern age < 1 day:  No decay
-        Pattern age 1-7 days: Linear decay
-        Pattern age > 7 days: Accelerated decay
+        Exponential decay: multiply motif confidence by 0.99 per elapsed 24h period.
         """
         if current_timestamp is None:
             current_timestamp = datetime.now(timezone.utc).isoformat()
 
-        try:
-            current_dt = self._parse_timestamp(current_timestamp)
-        except Exception:
-            return  # Skip decay if timestamp invalid
-
         with self._lock:
             for stored in self._motifs:
-                if not stored.created_at:
+                ref_ts = stored.decay_applied_at or stored.created_at
+                if not ref_ts:
                     continue
-
                 try:
-                    created_dt = self._parse_timestamp(stored.created_at)
-                    days_old = (current_dt - created_dt).total_seconds() / 86400.0
-
-                    # NEW: Non-linear decay function
-                    # Recent patterns (< 1 day): no decay
-                    if days_old > 1:
-                        # Decay accelerates with age
-                        if days_old <= 7:
-                            decay_amount = self.decay_per_day * days_old
-                        else:
-                            # Older patterns decay 2x faster
-                            decay_amount = self.decay_per_day * 7 + self.decay_per_day * 2 * (days_old - 7)
-
-                        stored.confidence = max(
-                            self.min_confidence,
-                            stored.confidence - decay_amount
-                        )
-                        stored.decay_applied_at = current_timestamp
+                    periods = _periods_24h_since(ref_ts, current_timestamp)
+                    if periods <= 0:
+                        continue
+                    stored.confidence = max(
+                        self.min_confidence,
+                        stored.confidence * (self.decay_factor_per_24h**periods),
+                    )
+                    stored.decay_applied_at = current_timestamp
                 except Exception:
-                    pass  # Skip if calculation fails
+                    pass
 
     def _prune_stale_patterns(self) -> None:
         """
@@ -198,14 +178,13 @@ class BehavioralMotifIndex:
         """
         # Remove by threshold
         self._motifs = [
-            m for m in self._motifs
-            if m.confidence >= self.pruning_threshold
+            m for m in self._motifs if m.confidence >= self.pruning_threshold
         ]
 
         # Keep only top N by confidence
         if len(self._motifs) > self.max_motifs:
             self._motifs.sort(key=lambda m: m.confidence, reverse=True)
-            self._motifs = self._motifs[:self.max_motifs]
+            self._motifs = self._motifs[: self.max_motifs]
 
     # ------------------------------------------------------------------
     # Read
@@ -214,7 +193,7 @@ class BehavioralMotifIndex:
     def find_similar(
         self,
         query_motif: IncidentMotif,
-        top_k: int = 5,
+        top_k: int = 50,
         min_similarity: float = 0.0,
     ) -> list[IncidentMatch]:
         """
@@ -240,7 +219,7 @@ class BehavioralMotifIndex:
             scored.sort(key=lambda x: x[0], reverse=True)
             top = scored[:top_k]
 
-            # Filter by minimum threshold to ensure confidence in matches
+            # Filter by minimum threshold (keep all if min_similarity=0.0 for max recall)
             filtered = [s for s in top if s[0] >= min_similarity]
 
             return [
@@ -252,13 +231,28 @@ class BehavioralMotifIndex:
                     remediation_outcome=m.motif.remediation_outcome,
                     timestamp=m.motif.timestamp,
                     canonical_ids=list(m.motif.canonical_ids),
-                    pattern_confidence=round(pattern_conf, 3),  # NEW: Show evolved confidence
+                    pattern_confidence=round(
+                        pattern_conf, 3
+                    ),  # NEW: Show evolved confidence
                 )
                 for score, m, rationale, pattern_conf in filtered
             ]
 
     def count(self) -> int:
         return len(self._motifs)
+
+    def save(self, filepath: str) -> None:
+        """Persist motif index including evolved confidences."""
+        with self._lock:
+            with open(filepath, "wb") as f:
+                pickle.dump(self._motifs, f)
+
+    def load(self, filepath: str) -> None:
+        with self._lock:
+            with open(filepath, "rb") as f:
+                loaded = pickle.load(f)
+            if isinstance(loaded, list):
+                self._motifs = loaded
 
     def all_motifs(self) -> list[IncidentMotif]:
         with self._lock:
@@ -295,7 +289,9 @@ class BehavioralMotifIndex:
                 "min_confidence": round(min(confidences), 3),
                 "total_reinforcements": sum(reinforcements),
                 "patterns_at_max": sum(1 for c in confidences if c >= 0.9),
-                "patterns_scheduled_for_pruning": sum(1 for c in confidences if c < 0.15),
+                "patterns_scheduled_for_pruning": sum(
+                    1 for c in confidences if c < 0.15
+                ),
             }
 
     # ------------------------------------------------------------------
@@ -315,8 +311,31 @@ class BehavioralMotifIndex:
 
 
 # ------------------------------------------------------------------
-# Similarity computation (unchanged, but now used with confidence weighting)
+# Similarity computation (CHANGE #1 & #2: NEW WEIGHTS AND PENALTY)
 # ------------------------------------------------------------------
+
+
+def _normalize_causal_shape(shape: list[tuple]) -> set[tuple[str, str, str]]:
+    """Normalize motif shapes to (src_role, relation, dst_role) triples."""
+    normalized: set[tuple[str, str, str]] = set()
+    for edge in shape:
+        t = tuple(edge)
+        if len(t) == 3:
+            normalized.add((str(t[0]), str(t[1]), str(t[2])))
+        elif len(t) == 2:
+            # Legacy 2-tuple shapes from older motifs
+            normalized.add((str(t[0]), "", str(t[1])))
+    return normalized
+
+
+def _role_shape_similarity(query: IncidentMotif, stored: IncidentMotif) -> float:
+    """Jaccard similarity on role-based (src, relation, dst) causal shapes.
+    NOTE: Not used in new high-discrimination formula (kept for compatibility).
+    """
+    q_edges = _normalize_causal_shape(query.causal_shape)
+    s_edges = _normalize_causal_shape(stored.causal_shape)
+    return _jaccard(q_edges, s_edges)
+
 
 def _jaccard(a: list | set, b: list | set) -> float:
     """Jaccard similarity between two sets."""
@@ -333,69 +352,58 @@ def _compute_similarity(
     stored: IncidentMotif,
 ) -> tuple[float, str]:
     """
-    Compute weighted similarity between two motifs.
+    Compute weighted similarity between two motifs — highly discriminative.
     Returns (score, rationale_string).
 
-    Weights (sum to 1.0):
-      0.50 — canonical ID overlap (PRIMARY: same service family across renames)
-      0.20 — causal shape (structural relationship similarity)
-      0.15 — event sequence Jaccard (event type overlap)
-      0.10 — remediation action match (same remediation bonus)
-      0.05 — sequence order similarity (temporal pattern match)
+    CHANGE #1: New weights (sum to 1.0):
+      0.85 — canonical ID overlap (DOMINANT: same service family across renames)
+      0.10 — event sequence Jaccard (event type overlap)
+      0.05 — content token similarity (log/metric/deploy fingerprints)
+
+    CHANGE #2: Hard gate: if both have a remediation_action and they differ, score *= 0.25
+    (penalizes cross-family matches where remediation differs)
 
     Key insight: Incidents from the same family must involve the same core services
-    (canonical IDs). All incidents follow the same deploy→metric→log→signal→remediation
-    pattern, so event patterns alone can't distinguish families. Only service identity
-    (captured in canonical_ids) defines the family.
+    (canonical IDs) AND be fixed by the same remediation actions. This is highly
+    discriminative for family identification.
     """
-    # 0. Canonical ID overlap — PRIMARY family discriminator
-    #    Same family incidents must share canonical_ids
-    q_cids = set(query.canonical_ids)
-    s_cids = set(stored.canonical_ids)
-    cid_sim = _jaccard(q_cids, s_cids)
-
-    # 1. Causal shape similarity — edge set Jaccard on (src_role, relation, dst_role) triples
-    # Handles both 2-tuple (legacy) and 3-tuple shapes
-    q_edges = set(tuple(x) for x in query.causal_shape)
-    s_edges = set(tuple(x) for x in stored.causal_shape)
-    shape_sim = _jaccard(q_edges, s_edges)
-
-    # 2. Event sequence Jaccard
+    # canonical_id is the ONLY reliable family signal — weight it at 0.85
+    cid_sim = _jaccard(set(query.canonical_ids), set(stored.canonical_ids))
     seq_sim = _jaccard(query.event_sequence, stored.event_sequence)
+    tok_sim = (
+        _jaccard(set(query.content_tokens), set(stored.content_tokens))
+        if (query.content_tokens and stored.content_tokens)
+        else 0.0
+    )
+    score = 0.85 * cid_sim + 0.10 * seq_sim + 0.05 * tok_sim
 
-    # 3. Remediation action match bonus
-    action_match = 0.0
-    if (
-        query.remediation_action
-        and stored.remediation_action
-        and query.remediation_action == stored.remediation_action
-    ):
-        action_match = 1.0
-
-    # 4. Sequence order similarity bonus — penalize if order is very different
-    order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
-
-    # NEW FORMULA with canonical_id as primary signal
-    score = 0.50 * cid_sim + 0.20 * shape_sim + 0.15 * seq_sim + 0.10 * action_match + 0.05 * order_bonus
+    # CHANGE #2: Hard penalty — if both motifs have remediation_action and they differ
+    if query.remediation_action and stored.remediation_action:
+        if query.remediation_action != stored.remediation_action:
+            score *= 0.25  # Cross-family penalty
 
     # Build rationale
     parts = []
+    q_cids = set(query.canonical_ids)
+    s_cids = set(stored.canonical_ids)
     if cid_sim > 0:
         common_cids = q_cids & s_cids
         parts.append(f"canonical ID overlap: {cid_sim:.0%}")
         if common_cids:
             parts.append(f"shared services: {', '.join(sorted(common_cids))}")
-    if shape_sim > 0:
-        common_shapes = q_edges & s_edges
-        parts.append(f"causal shape similarity: {shape_sim:.0%}")
-        if common_shapes:
-            sample = list(common_shapes)[:2]
-            parts.append(f"shared patterns: {sample}")
     if seq_sim > 0:
         common_events = set(query.event_sequence) & set(stored.event_sequence)
         parts.append(f"shared event types: {', '.join(sorted(common_events))}")
-    if action_match:
-        parts.append(f"same remediation: {stored.remediation_action}")
+    if tok_sim > 0:
+        parts.append(f"content similarity: {tok_sim:.0%}")
+    if (
+        query.remediation_action
+        and stored.remediation_action
+        and query.remediation_action != stored.remediation_action
+    ):
+        parts.append(
+            f"remediation mismatch (×0.25): {query.remediation_action} vs {stored.remediation_action}"
+        )
     rationale = "; ".join(parts) if parts else "low structural overlap"
 
     return score, rationale
@@ -405,6 +413,7 @@ def _sequence_order_similarity(a: list[str], b: list[str]) -> float:
     """
     Measure how similar the ordering of shared elements is between two sequences.
     Uses longest common subsequence length normalized by max length.
+    NOTE: Not used in new high-discrimination formula (kept for compatibility).
     """
     if not a or not b:
         return 0.0

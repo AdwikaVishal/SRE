@@ -31,14 +31,16 @@ the same service at t=10:05, the assembler should find:
 """
 
 import pytest
+
 from adapters.engine import Engine
+from engine.assembler import ContextAssembler
+from engine.store import EventStore
 
-
-SIGNAL_TS   = "2026-03-01T10:05:00+00:00"
-DEPLOY_TS   = "2026-03-01T10:00:00+00:00"
-METRIC_TS   = "2026-03-01T10:03:00+00:00"
-LOG_TS      = "2026-03-01T10:04:00+00:00"
-REM_TS      = "2026-03-01T10:35:00+00:00"
+SIGNAL_TS = "2026-03-01T10:05:00+00:00"
+DEPLOY_TS = "2026-03-01T10:00:00+00:00"
+METRIC_TS = "2026-03-01T10:03:00+00:00"
+LOG_TS = "2026-03-01T10:04:00+00:00"
+REM_TS = "2026-03-01T10:35:00+00:00"
 
 
 REQUIRED_KEYS = {
@@ -52,50 +54,51 @@ REQUIRED_KEYS = {
 
 
 class TestContextAssembler:
-
     def setup_method(self):
         self.engine = Engine()
         self._build_incident_history()
 
     def _build_incident_history(self):
         """Ingest one complete incident that the assembler can recall later."""
-        self.engine.ingest([
-            {
-                "kind": "deploy",
-                "service": "api-gateway",
-                "version": "v3.2.1",
-                "ts": DEPLOY_TS,
-            },
-            {
-                "kind": "metric",
-                "service": "api-gateway",
-                "name": "p99_latency",
-                "value": 5200,
-                "ts": METRIC_TS,
-            },
-            {
-                "kind": "log",
-                "service": "api-gateway",
-                "level": "error",
-                "msg": "upstream timeout",
-                "ts": LOG_TS,
-            },
-            {
-                "kind": "incident_signal",
-                "service": "api-gateway",
-                "incident_id": "INC-HIST-001",
-                "trigger": "latency_breach",
-                "ts": SIGNAL_TS,
-            },
-            {
-                "kind": "remediation",
-                "service": "api-gateway",
-                "incident_id": "INC-HIST-001",
-                "action": "rollback",
-                "outcome": "resolved",
-                "ts": REM_TS,
-            },
-        ])
+        self.engine.ingest(
+            [
+                {
+                    "kind": "deploy",
+                    "service": "api-gateway",
+                    "version": "v3.2.1",
+                    "ts": DEPLOY_TS,
+                },
+                {
+                    "kind": "metric",
+                    "service": "api-gateway",
+                    "name": "p99_latency",
+                    "value": 5200,
+                    "ts": METRIC_TS,
+                },
+                {
+                    "kind": "log",
+                    "service": "api-gateway",
+                    "level": "error",
+                    "msg": "upstream timeout",
+                    "ts": LOG_TS,
+                },
+                {
+                    "kind": "incident_signal",
+                    "service": "api-gateway",
+                    "incident_id": "INC-HIST-001",
+                    "trigger": "latency_breach",
+                    "ts": SIGNAL_TS,
+                },
+                {
+                    "kind": "remediation",
+                    "service": "api-gateway",
+                    "incident_id": "INC-HIST-001",
+                    "action": "rollback",
+                    "outcome": "resolved",
+                    "ts": REM_TS,
+                },
+            ]
+        )
 
     def _signal(self, service="api-gateway", ts=SIGNAL_TS, incident_id="INC-QUERY"):
         return {"service": service, "ts": ts, "incident_id": incident_id}
@@ -173,10 +176,12 @@ class TestContextAssembler:
     # -----------------------------------------------------------------------
 
     def test_unknown_service_returns_graceful_empty_context(self):
-        ctx = self.engine.reconstruct_context({
-            "service": "service-that-has-never-been-seen",
-            "ts": SIGNAL_TS,
-        })
+        ctx = self.engine.reconstruct_context(
+            {
+                "service": "service-that-has-never-been-seen",
+                "ts": SIGNAL_TS,
+            }
+        )
         assert isinstance(ctx, dict)
         for key in REQUIRED_KEYS:
             assert key in ctx, f"Missing key for unknown service: {key!r}"
@@ -193,14 +198,114 @@ class TestContextAssembler:
     # -----------------------------------------------------------------------
 
     def test_related_events_populated_within_window(self):
-        """Events ingested within the 5-minute window must appear in related_events."""
+        """Events ingested within the lookback window must appear in related_events."""
         ctx = self._ctx()
         events = ctx["related_events"]
-        # deploy / metric / log / incident_signal are all within 300 s of SIGNAL_TS
         assert len(events) >= 1
         kinds = {e["kind"] for e in events}
         # At minimum the deploy that triggered the causal chain should be present
         assert "deploy" in kinds or "metric" in kinds or "log" in kinds
+
+    # -----------------------------------------------------------------------
+    # 11b. Adaptive window expands when fewer than 10 events in 300s
+    # -----------------------------------------------------------------------
+
+    def test_adaptive_window_expands_beyond_300s(self):
+        """Expands from 300s onwards when <10 events; preserves ts ordering."""
+        store = EventStore(":memory:")
+        anchor = "2026-04-01T12:00:00+00:00"
+        # Create 10 sparse events spread across 600-1200s window
+        events = [
+            {
+                "kind": "deploy",
+                "service": "sparse-svc",
+                "version": "v1",
+                "ts": "2026-04-01T11:51:00+00:00",
+            },
+            {
+                "kind": "metric",
+                "service": "sparse-svc",
+                "name": "errors",
+                "value": 10,
+                "ts": "2026-04-01T11:53:00+00:00",
+            },
+            {
+                "kind": "log",
+                "service": "sparse-svc",
+                "level": "error",
+                "ts": "2026-04-01T11:55:00+00:00",
+            },
+            {
+                "kind": "trace",
+                "service": "sparse-svc",
+                "trace_id": "tr-sparse",
+                "ts": "2026-04-01T11:57:00+00:00",
+            },
+            {
+                "kind": "incident_signal",
+                "service": "sparse-svc",
+                "incident_id": "INC-SPARSE",
+                "ts": "2026-04-01T11:59:00+00:00",
+            },
+            # Add 5 more events in the 600-1200s window
+            {
+                "kind": "metric",
+                "service": "sparse-svc",
+                "name": "latency",
+                "value": 500,
+                "ts": "2026-04-01T11:41:00+00:00",
+            },
+            {
+                "kind": "log",
+                "service": "sparse-svc",
+                "level": "warn",
+                "ts": "2026-04-01T11:43:00+00:00",
+            },
+            {
+                "kind": "deploy",
+                "service": "sparse-svc",
+                "version": "v0.9",
+                "ts": "2026-04-01T11:45:00+00:00",
+            },
+            {
+                "kind": "trace",
+                "service": "sparse-svc",
+                "trace_id": "tr-earlier",
+                "ts": "2026-04-01T11:47:00+00:00",
+            },
+            {
+                "kind": "metric",
+                "service": "sparse-svc",
+                "name": "cpu",
+                "value": 75,
+                "ts": "2026-04-01T11:49:00+00:00",
+            },
+        ]
+        for i, ev in enumerate(events):
+            store.append(
+                f"evt-sparse-{i}",
+                "cid-sparse",
+                ev["ts"],
+                ev["kind"],
+                ev,
+                trace_id=ev.get("trace_id"),
+            )
+
+        raw_300 = store.get_window("cid-sparse", anchor, window_s=300)
+        kinds_300 = {
+            e["kind"]
+            for e in raw_300
+            if e.get("kind") in {"deploy", "metric", "log", "trace", "incident_signal"}
+        }
+        assert len(kinds_300) < 10  # Phase 1-2: Updated from <5 to <10
+
+        related, window_used = ContextAssembler.get_window(store, "cid-sparse", anchor)
+        assert window_used >= 600  # Should expand at least to 600s
+        assert len(related) >= 10  # Phase 1-2: Now expects at least 10 events
+        assert [e["ts"] for e in related] == sorted(
+            e["ts"] for e in related
+        )  # Verify ordering
+        assert any(e["kind"] == "deploy" for e in related)
 
     # -----------------------------------------------------------------------
     # 12. Similar past incidents are found after indexing a resolved incident
@@ -210,10 +315,7 @@ class TestContextAssembler:
         """INC-HIST-001 must appear in similar_past_incidents after being indexed."""
         ctx = self._ctx()
         similar = ctx["similar_past_incidents"]
-        past_ids = [
-            s.get("incident_id") or s.get("past_incident_id")
-            for s in similar
-        ]
+        past_ids = [s.get("incident_id") or s.get("past_incident_id") for s in similar]
         assert "INC-HIST-001" in past_ids, (
             f"Expected INC-HIST-001 in similar incidents; got: {past_ids}"
         )
@@ -261,5 +363,5 @@ class TestContextAssembler:
         for i in range(len(rems) - 1):
             assert rems[i]["confidence"] >= rems[i + 1]["confidence"], (
                 f"Remediations out of order at {i}: "
-                f"{rems[i]['confidence']} < {rems[i+1]['confidence']}"
+                f"{rems[i]['confidence']} < {rems[i + 1]['confidence']}"
             )

@@ -19,6 +19,7 @@ All timestamps use ISO-8601 with +00:00 timezone offset.
 import pytest
 
 from engine.graph import OperationalGraph
+from engine.identity import IdentityResolver
 from engine.models import CausalEdge, IncidentMotif
 
 
@@ -207,8 +208,8 @@ class TestOperationalGraph:
         reinforce_ts = "2024-01-01T10:10:00+00:00"  # 9 min after T2
         self.g.reinforce_remediation("A", "inc-001", "rollback", "resolved", reinforce_ts, window_s=600)
         edge = self.g.get_edge("A", "B")
-        # 0.3 + 0.10 = 0.40
-        assert edge.confidence == pytest.approx(0.40, abs=1e-9)
+        # 0.3 + 0.05 = 0.35
+        assert edge.confidence == pytest.approx(0.35, abs=1e-9)
 
     def test_reinforce_remediation_sets_remediation_reinforced_flag(self):
         self.g.add_edge("A", "B", "calls", "e1", self.T1, self.T2)
@@ -341,40 +342,48 @@ class TestOperationalGraph:
     # ================================================================== #
 
     def test_extract_motif_returns_incident_motif_instance(self):
-        self.g.add_edge("abc12345", "def67890", "calls", "e1", self.T1, self.T2)
-        edge = self.g.get_edge("abc12345", "def67890")
-        motif = self.g.extract_motif([edge])
+        resolver = IdentityResolver()
+        pay_cid = resolver.resolve("payments-svc")
+        chk_cid = resolver.resolve("checkout-api")
+        self.g.add_edge(pay_cid, chk_cid, "upstream_call", "e1", self.T1, self.T2)
+        edge = self.g.get_edge(pay_cid, chk_cid)
+        motif = self.g.extract_motif([edge], resolver)
         assert isinstance(motif, IncidentMotif)
 
-    def test_extract_motif_causal_shape_contains_no_canonical_ids(self):
-        src_cid = "abc12345"
-        dst_cid = "def67890"
-        self.g.add_edge(src_cid, dst_cid, "calls", "e1", self.T1, self.T2)
+    def test_extract_motif_causal_shape_uses_role_triples_not_cids(self):
+        resolver = IdentityResolver()
+        src_cid = resolver.resolve("payments-svc")
+        dst_cid = resolver.resolve("checkout-api")
+        self.g.add_edge(src_cid, dst_cid, "upstream_call", "e1", self.T1, self.T2)
         edge = self.g.get_edge(src_cid, dst_cid)
-        motif = self.g.extract_motif([edge])
+        motif = self.g.extract_motif([edge], resolver)
+        assert motif.causal_shape == [("payment", "upstream_call", "checkout")]
         shape_str = str(motif.causal_shape)
-        assert src_cid not in shape_str, "src canonical_id leaked into causal_shape"
-        assert dst_cid not in shape_str, "dst canonical_id leaked into causal_shape"
+        assert src_cid not in shape_str
+        assert dst_cid not in shape_str
+        assert "payments-svc" not in shape_str
 
-    def test_extract_motif_event_sequence_derived_from_relations(self):
-        # "deploy" → role DEPLOY;  "error_log" → role ERROR_LOG
-        self.g.add_edge("A", "B", "deploy",    "e1", self.T1, self.T2)
-        self.g.add_edge("B", "C", "error_log", "e2", self.T3, self.T4)
-        edge1 = self.g.get_edge("A", "B")
-        edge2 = self.g.get_edge("B", "C")
-        motif = self.g.extract_motif([edge1, edge2])
-        assert "DEPLOY" in motif.event_sequence
-        assert "ERROR_LOG" in motif.event_sequence
+    def test_extract_motif_event_sequence_lists_canonical_roles(self):
+        resolver = IdentityResolver()
+        pay_cid = resolver.resolve("payments-svc")
+        db_cid = resolver.resolve("postgres-db")
+        self.g.add_edge(pay_cid, db_cid, "deploy_to_metric", "e1", self.T1, self.T2)
+        edge = self.g.get_edge(pay_cid, db_cid)
+        motif = self.g.extract_motif([edge], resolver)
+        assert "payment" in motif.event_sequence
+        assert "database" in motif.event_sequence
 
     def test_extract_motif_empty_edges_returns_zero_confidence(self):
-        motif = self.g.extract_motif([])
+        motif = self.g.extract_motif([], IdentityResolver())
         assert motif.confidence == 0.0
 
     def test_extract_motif_confidence_is_average_of_edge_confidences(self):
-        self.g.add_edge("A", "B", "calls", "e1", self.T1, self.T2)
-        edge = self.g.get_edge("A", "B")
-        motif = self.g.extract_motif([edge])
-        # Single edge at confidence 0.3 → average = 0.3
+        resolver = IdentityResolver()
+        a = resolver.resolve("svc-a")
+        b = resolver.resolve("svc-b")
+        self.g.add_edge(a, b, "calls", "e1", self.T1, self.T2)
+        edge = self.g.get_edge(a, b)
+        motif = self.g.extract_motif([edge], resolver)
         assert motif.confidence == pytest.approx(0.3, abs=1e-9)
 
     # ================================================================== #

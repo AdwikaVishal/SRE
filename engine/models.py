@@ -52,7 +52,7 @@ class CausalEdge:
             "effect_id": self.dst_cid,
             "cause_name": resolver.current_name(self.src_cid),
             "effect_name": resolver.current_name(self.dst_cid),
-            "evidence": list(self.evidence_ids),   # required by spec
+            "evidence": list(self.evidence_ids),  # required by spec
             "confidence": round(float(self.confidence), 3),
             # Additional context fields (non-binding but useful)
             "relation": self.relation,
@@ -61,10 +61,12 @@ class CausalEdge:
         }
 
 
-
 @dataclass
 class IncidentMotif:
-    """Abstract behavioral pattern (no service names).
+    """Abstract behavioral pattern (no raw service names in causal_shape).
+
+    causal_shape entries are (src_canonical_role, relation, dst_canonical_role)
+    triples derived from IdentityResolver (e.g. payment, checkout, database).
 
     Must be constructible with no args because `OperationalGraph.extract_motif()`
     builds an empty motif and fills fields incrementally.
@@ -73,8 +75,11 @@ class IncidentMotif:
     incident_id: str = ""
     canonical_ids: List[str] = field(default_factory=list)  # provenance only
     event_sequence: List[str] = field(default_factory=list)
-    causal_shape: List[tuple] = field(default_factory=list)
+    causal_shape: List[tuple] = field(
+        default_factory=list
+    )  # (src_role, relation, dst_role)
     remediation_action: str = ""
     remediation_outcome: str = ""
     timestamp: str = ""
     confidence: float = 0.0
+    content_tokens: List[str] = field(default_factory=list)

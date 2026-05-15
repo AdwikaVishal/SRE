@@ -9,10 +9,14 @@ All timestamps use a fixed BASE_TIME to keep tests deterministic and to avoid
 confidence-decay surprises (all events are on the same day, so days_old == 0).
 """
 
+import tempfile
+from pathlib import Path
+
 import pytest
 from datetime import datetime, timedelta, timezone
 
 from adapters.engine import Engine
+from engine.graph import REMEDIATION_BOOST
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +344,47 @@ class TestEngine:
         })
         assert isinstance(ctx["explain"], str)
         assert len(ctx["explain"]) > 0
+
+    # -----------------------------------------------------------------------
+    # 16. Resolved remediation boosts causal-chain edges and success_counter
+    # -----------------------------------------------------------------------
+
+    def test_resolved_remediation_boosts_causal_edges_and_success_counter(self):
+        service = "svc-learn"
+        inc_id = "INC-LEARN-001"
+        self.engine.ingest(make_incident(service, inc_id))
+
+        cid = self.engine.resolver.resolve(service)
+        edges = self.engine.graph.get_causal_chain(cid, max_hops=2, min_confidence=0.0)
+        assert edges, "Expected causal chain after incident ingest"
+        edge = edges[0]
+        boosted = self.engine.graph.get_edge(edge.src_cid, edge.dst_cid)
+        assert boosted.confidence >= 0.3 + REMEDIATION_BOOST - 1e-9
+
+        stored = [
+            m for m in self.engine.motifs._motifs
+            if m.motif.incident_id == inc_id
+        ]
+        assert len(stored) == 1
+        assert stored[0].success_counter == 1
+
+    # -----------------------------------------------------------------------
+    # 17. Persisted confidences survive Engine reload
+    # -----------------------------------------------------------------------
+
+    def test_persisted_confidences_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            e1 = Engine(persistence_dir=str(state_dir))
+            e1.ingest(make_incident("svc-persist", "INC-PERSIST-001"))
+            cid = e1.resolver.resolve("svc-persist")
+            conf_after = e1.graph.get_causal_chain(cid, max_hops=2, min_confidence=0.0)[0].confidence
+            e1.close()
+
+            e2 = Engine(persistence_dir=str(state_dir))
+            reloaded = e2.graph.get_causal_chain(cid, max_hops=2, min_confidence=0.0)
+            assert reloaded
+            assert reloaded[0].confidence == pytest.approx(conf_after, abs=1e-9)
+            stored = [m for m in e2.motifs._motifs if m.motif.incident_id == "INC-PERSIST-001"]
+            assert stored and stored[0].success_counter == 1
+            e2.close()

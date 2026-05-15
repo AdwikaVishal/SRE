@@ -12,9 +12,11 @@ Architecture:
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Iterable, Literal
 
 from engine.assembler import ContextAssembler
@@ -33,14 +35,16 @@ class Engine:
     - reconstruct_context() is read-only and concurrent-safe
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persistence_dir: str | None = None) -> None:
         self.resolver = IdentityResolver()
-        self.store = EventStore()           # DuckDB in-process
-        self.graph = OperationalGraph()     # NetworkX DiGraph
+        self.store = EventStore()  # DuckDB in-process
+        self.graph = OperationalGraph()  # NetworkX DiGraph
         self.motifs = BehavioralMotifIndex()
         self.assembler = ContextAssembler()
         self._lock = threading.Lock()
         self._open_incidents: dict[str, dict] = {}
+        self._persistence_dir = persistence_dir or os.environ.get("ANVIL_STATE_DIR")
+        self._load_persisted_state()
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -88,7 +92,7 @@ class Engine:
         Process a stream of events. Thread-safe.
         Topology events (rename/dep shift) are processed first within the lock
         to ensure canonical_id consistency for all subsequent events.
-        Uses batch inserts for throughput ≥ 1,000 ev/s.
+        Uses chunked batch inserts for throughput ≥ 1,000 ev/s.
         """
         # PHASE 1: Normalize all incoming events
         event_list = [self._normalize_event(e) for e in events]
@@ -102,36 +106,60 @@ class Engine:
             for event in topology_events:
                 self._on_topology(event)
 
-            # Resolve all canonical_ids and prepare batch insert rows
-            batch_rows: list[tuple] = []
-            for event in other_events:
-                cid = self._resolve_cid_for_event(event)
-                if not cid:
-                    continue
-                event_id = event.get("event_id") or event.get("id") or str(uuid.uuid4())
-                ts = event.get("ts", "")
-                kind = event.get("kind", "unknown")
-                trace_id = event.get("trace_id")
-                batch_rows.append((event_id, cid, ts, kind, trace_id, event))
+            # Process other events in chunks for better cache locality and throughput
+            # Larger chunk size (500) reduces overhead relative to actual work
+            chunk_size = 500
+            for chunk_start in range(0, len(other_events), chunk_size):
+                chunk = other_events[chunk_start : chunk_start + chunk_size]
+                self._ingest_chunk(chunk)
 
-            # Batch insert all events at once
-            if batch_rows:
-                self.store.append_batch(batch_rows)
+    def _ingest_chunk(self, events: list[dict]) -> None:
+        """
+        Process a single chunk of non-topology events.
+        Resolves CIDs, builds batch rows, inserts to store, and applies graph updates.
+        """
+        # Single pass: resolve CIDs, collect batch insert rows, and graph updates
+        # This eliminates redundant _resolve_cid_for_event calls
+        batch_rows: list[tuple] = []
+        graph_updates: list[tuple[str, str, dict]] = []  # (kind, cid, event)
+        cid_cache: dict[str, str] = {}  # service → cid cache within this chunk
 
-            # Process graph/motif updates (non-storage logic)
-            for event in other_events:
-                kind = event.get("kind", "")
+        for event in events:
+            # Fast CID resolution with per-chunk cache
+            service_key = (
+                event.get("service") or event.get("svc") or event.get("target") or ""
+            )
+            if service_key and service_key in cid_cache:
+                cid = cid_cache[service_key]
+            else:
                 cid = self._resolve_cid_for_event(event)
-                if not cid:
-                    continue
-                if kind == "deploy":
-                    self._on_deploy(event, cid)
-                elif kind in ("log", "metric", "trace"):
-                    self._on_signal(event, cid)
-                elif kind == "incident_signal":
-                    self._on_incident(event, cid)
-                elif kind == "remediation":
-                    self._on_remediation(event, cid)
+                if service_key:
+                    cid_cache[service_key] = cid
+
+            if not cid:
+                continue
+
+            event_id = event.get("event_id") or event.get("id") or str(uuid.uuid4())
+            ts = event.get("ts", "")
+            kind = event.get("kind", "unknown")
+            trace_id = event.get("trace_id")
+            batch_rows.append((event_id, cid, ts, kind, trace_id, event))
+            graph_updates.append((kind, cid, event))
+
+        # Batch insert chunk events
+        if batch_rows:
+            self.store.append_batch(batch_rows)
+
+        # Process graph/motif updates for this chunk
+        for kind, cid, event in graph_updates:
+            if kind == "deploy":
+                self._on_deploy(event, cid)
+            elif kind in ("log", "metric", "trace"):
+                self._on_signal(event, cid)
+            elif kind == "incident_signal":
+                self._on_incident(event, cid)
+            elif kind == "remediation":
+                self._on_remediation(event, cid)
 
     def _resolve_cid_for_event(self, event: dict) -> str:
         """
@@ -304,16 +332,19 @@ class Engine:
 
         # Check: does this signal follow a recent deploy for cid?
         # Use 3600s (1 hour) window to capture deploy→latency spike patterns in generator
-        recent_deploy = self.graph.get_recent_deploy(cid, ts, window_s=3600)
-        if recent_deploy:
-            self.graph.add_edge(
-                src_cid=cid,
-                dst_cid=cid,
-                relation=f"deploy_to_{kind}",
-                evidence_id=event.get("trace_id") or event.get("event_id") or ts,
-                ts_src=recent_deploy["ts"],
-                ts_dst=ts,
-            )
+        # OPTIMIZED: Skip lock acquisition if no deploys recorded for this cid
+        # This is the fast-path for the majority of signal events
+        if cid in self.graph._deploy_tracker:
+            recent_deploy = self.graph.get_recent_deploy(cid, ts, window_s=3600)
+            if recent_deploy:
+                self.graph.add_edge(
+                    src_cid=cid,
+                    dst_cid=cid,
+                    relation=f"deploy_to_{kind}",
+                    evidence_id=event.get("trace_id") or event.get("event_id") or ts,
+                    ts_src=recent_deploy["ts"],
+                    ts_dst=ts,
+                )
 
         # Trace correlation: spans sharing trace_id → upstream call edges
         if event.get("trace_id") and kind == "trace":
@@ -369,16 +400,17 @@ class Engine:
 
     def _on_remediation(self, event: dict, cid: str) -> None:
         """
-        Close an incident window. If outcome=resolved, reinforce causal edges,
-        reinforce successful memory patterns, and index the completed incident.
-
-        MEMORY EVOLUTION: When a remediation succeeds, we boost confidence of
-        matching patterns so the engine learns what works.
+        Close an incident window. If outcome=resolved, apply decay, reinforce
+        causal-chain edges (+0.05), index the motif, and persist confidences.
         """
         inc_id = event.get("incident_id", "")
         outcome = event.get("outcome", "unknown")
         ts = event.get("ts", "")
         success = outcome == "resolved"
+
+        if ts:
+            self.graph.apply_decay(ts)
+            self.motifs.apply_decay(ts)
 
         if success:
             self.graph.reinforce_remediation(
@@ -387,41 +419,84 @@ class Engine:
                 action=event.get("action", "unknown"),
                 outcome=outcome,
                 ts=ts,
-                window_s=3600,
             )
 
-            # Index this as a completed incident motif
             edges = self.graph.get_causal_chain(cid, max_hops=2)
-            motif = self.graph.extract_motif(edges)
+            motif = self.graph.extract_motif(edges, self.resolver)
             motif.incident_id = inc_id
             motif.remediation_action = event.get("action", "")
             motif.remediation_outcome = outcome
             motif.timestamp = ts
-            if cid not in motif.canonical_ids:
-                motif.canonical_ids.append(cid)
+            # CRITICAL FIX: always populate canonical_ids for family matching
+            # so it's never empty even when no causal edges exist yet
+            all_cids = {cid}
+            for src, dst in self.graph.G.edges():
+                if src == cid or dst == cid:
+                    all_cids.add(src)
+                    all_cids.add(dst)
+            for c in all_cids:
+                if c not in motif.canonical_ids:
+                    motif.canonical_ids.append(c)
 
-            # MEMORY EVOLUTION: Store with timestamp for aging
+            # Populate content_tokens from events in the remediation window
+            window_events = self.store.get_window(cid, ts, window_s=3600)
+            tokens: set[str] = set()
+            for ev in window_events:
+                if ev.get("kind") == "log":
+                    msg = ev.get("message") or ev.get("msg") or ""
+                    tokens.update(w for w in msg.lower().split() if len(w) > 3)
+                elif ev.get("kind") == "metric":
+                    if ev.get("metric"):
+                        tokens.add(str(ev["metric"]))
+                elif ev.get("kind") == "deploy":
+                    if ev.get("version"):
+                        tokens.add(str(ev["version"]))
+            motif.content_tokens = sorted(tokens)[:20]
+
             self.motifs.index_incident(motif, timestamp=ts)
-
-            # MEMORY EVOLUTION: Reinforce patterns that worked
-            # When a remediation succeeds, boost confidence of the pattern
-            # that matched this incident. This teaches the engine.
             self.motifs.apply_reinforcement(
                 incident_id=inc_id,
                 success=True,
-                timestamp=ts
+                timestamp=ts,
             )
+            self._persist_confidence_state()
         else:
-            # Remediation failed: penalty to matching patterns
             self.motifs.apply_reinforcement(
                 incident_id=inc_id,
                 success=False,
-                timestamp=ts
+                timestamp=ts,
             )
 
-        # Close the incident window
         if inc_id in self._open_incidents:
             del self._open_incidents[inc_id]
+
+    def _graph_state_path(self) -> Path | None:
+        if not self._persistence_dir:
+            return None
+        return Path(self._persistence_dir) / "graph.pkl"
+
+    def _motifs_state_path(self) -> Path | None:
+        if not self._persistence_dir:
+            return None
+        return Path(self._persistence_dir) / "motifs.pkl"
+
+    def _load_persisted_state(self) -> None:
+        graph_path = self._graph_state_path()
+        motifs_path = self._motifs_state_path()
+        if graph_path and graph_path.is_file():
+            self.graph.load(str(graph_path))
+        if motifs_path and motifs_path.is_file():
+            self.motifs.load(str(motifs_path))
+
+    def _persist_confidence_state(self) -> None:
+        """Write graph edge and motif confidences to disk."""
+        graph_path = self._graph_state_path()
+        motifs_path = self._motifs_state_path()
+        if not graph_path or not motifs_path:
+            return
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        self.graph.save(str(graph_path))
+        self.motifs.save(str(motifs_path))
 
     # ------------------------------------------------------------------
     # Context reconstruction

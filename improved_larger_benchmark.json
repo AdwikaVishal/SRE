@@ -1,0 +1,76 @@
+{
+  "adapter": "adapters.engine:Engine",
+  "mode": "fast",
+  "seeds": [
+    9999,
+    31415,
+    27182,
+    16180,
+    11235
+  ],
+  "results": [
+    {
+      "seed": 9999,
+      "success": true,
+      "latency_ms": 5.6,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    },
+    {
+      "seed": 31415,
+      "success": true,
+      "latency_ms": 0.8,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    },
+    {
+      "seed": 27182,
+      "success": true,
+      "latency_ms": 0.72,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    },
+    {
+      "seed": 16180,
+      "success": true,
+      "latency_ms": 0.87,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    },
+    {
+      "seed": 11235,
+      "success": true,
+      "latency_ms": 0.9,
+      "confidence": 0.427,
+      "related_events": 8,
+      "causal_chain_len": 4,
+      "similar_incidents": 1,
+      "remediations": 1,
+      "errors": null
+    }
+  ],
+  "summary": {
+    "pass_rate": 1.0,
+    "avg_latency_ms": 1.78,
+    "avg_confidence": 0.427,
+    "total_seeds": 5,
+    "passed": 5,
+    "failed": 0
+  }
+}

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
 from networkx.algorithms import isomorphism
 
+from .identity import IdentityResolver
 from .models import CausalEdge, IncidentMotif
 
 
@@ -42,6 +43,25 @@ def _days_between(ts1: str, ts2: str) -> float:
     dt1 = _parse_ts(ts1)
     dt2 = _parse_ts(ts2)
     return abs((dt2 - dt1).total_seconds() / 86400.0)
+
+
+def _periods_24h_since(ref_ts: str, now_ts: str) -> int:
+    """Full 24-hour periods elapsed between ref_ts and now_ts."""
+    if not ref_ts:
+        return 0
+    try:
+        elapsed_s = (_parse_ts(now_ts) - _parse_ts(ref_ts)).total_seconds()
+    except Exception:
+        return 0
+    if elapsed_s < 86400.0:
+        return 0
+    return int(elapsed_s // 86400.0)
+
+
+# Exponential confidence decay: multiply by this factor per 24h elapsed
+DECAY_FACTOR_PER_24H = 0.99
+CONFIDENCE_CAP = 0.95
+REMEDIATION_BOOST = 0.05
 
 
 def _abstract_event_type(relation: str) -> str:
@@ -191,7 +211,9 @@ class OperationalGraph:
                             first_seen=data.get("first_seen", ""),
                             last_seen=data.get("last_seen", ""),
                             evidence_ids=list(data.get("evidence_ids", [])),
-                            remediation_reinforced=bool(data.get("remediation_reinforced", False)),
+                            remediation_reinforced=bool(
+                                data.get("remediation_reinforced", False)
+                            ),
                             reinforced_by=list(data.get("reinforced_by", [])),
                         )
                     )
@@ -212,7 +234,9 @@ class OperationalGraph:
                             first_seen=data.get("first_seen", ""),
                             last_seen=data.get("last_seen", ""),
                             evidence_ids=list(data.get("evidence_ids", [])),
-                            remediation_reinforced=bool(data.get("remediation_reinforced", False)),
+                            remediation_reinforced=bool(
+                                data.get("remediation_reinforced", False)
+                            ),
                             reinforced_by=list(data.get("reinforced_by", [])),
                         )
                     )
@@ -234,31 +258,28 @@ class OperationalGraph:
         outcome: str,
         ts: str,
         window_s: int = 600,
-    ) -> None:
+        max_hops: int = 2,
+    ) -> int:
+        """
+        On resolved remediation, boost confidence (+0.05, cap 0.95) for every edge
+        in the incident's causal chain. Returns count of reinforced edges.
+        """
         if outcome != "resolved":
-            return
+            return 0
 
-        window_start = _subtract_seconds(ts, window_s)
+        chain_edges = self.get_causal_chain(cid, max_hops=max_hops, min_confidence=0.0)
+        reinforced_count = 0
+        seen: set[tuple[str, str]] = set()
 
         with self._lock:
-            reinforced_count = 0
-
-            for u, v, data in self.G.edges(data=True):
-                if u != cid and v != cid:
+            for edge in chain_edges:
+                key = (edge.src_cid, edge.dst_cid)
+                if key in seen or not self.G.has_edge(edge.src_cid, edge.dst_cid):
                     continue
-
-                # reinforce edges that were seen in [window_start, ts]
-                last_seen = data.get("last_seen", "")
-                if not last_seen:
-                    continue
-
-                if not (_is_before(window_start, last_seen) or last_seen == window_start):
-                    continue
-                if not (_is_before(last_seen, ts) or last_seen == ts):
-                    continue
-
+                seen.add(key)
+                data = self.G[edge.src_cid][edge.dst_cid]
                 old_conf = float(data.get("confidence", 0.0))
-                data["confidence"] = min(0.95, old_conf + 0.10)
+                data["confidence"] = min(CONFIDENCE_CAP, old_conf + REMEDIATION_BOOST)
                 data["remediation_reinforced"] = True
                 data.setdefault("reinforced_by", [])
                 data["reinforced_by"].append(
@@ -284,6 +305,8 @@ class OperationalGraph:
                     "reinforced_edges": reinforced_count,
                 }
             )
+
+        return reinforced_count
 
     def get_remediation_history(self, cid: str) -> List[dict]:
         return list(self._remediation_table.get(cid, []))
@@ -344,8 +367,13 @@ class OperationalGraph:
 
     def record_deploy(self, cid: str, version: str, ts: str) -> None:
         with self._lock:
+            # Pre-parse timestamp to avoid re-parsing in get_recent_deploy
+            try:
+                dt = _parse_ts(ts)
+            except Exception:
+                dt = None
             self._deploy_tracker.setdefault(cid, []).append(
-                {"canonical_id": cid, "version": version, "ts": ts}
+                {"canonical_id": cid, "version": version, "ts": ts, "_dt": dt}
             )
 
     def get_recent_deploy(
@@ -359,45 +387,68 @@ class OperationalGraph:
             if not deploys:
                 return None
 
-            window_start = _subtract_seconds(before_ts, window_s)
+            # Parse before_ts once, outside the loop
+            try:
+                before_dt = _parse_ts(before_ts)
+                window_start_dt = before_dt - timedelta(seconds=window_s)
+            except Exception:
+                return None
+
             candidates = []
             for d in deploys:
-                dts = d.get("ts", "")
-                if not dts:
-                    continue
-                if (_is_before(window_start, dts) or dts == window_start) and (
-                    _is_before(dts, before_ts) or dts == before_ts
-                ):
+                dt = d.get("_dt")  # Use pre-parsed datetime if available
+                if dt is None:
+                    # Fallback: parse it (for backward compatibility)
+                    try:
+                        dt = _parse_ts(d.get("ts", ""))
+                    except Exception:
+                        continue
+
+                # Pure datetime comparison (no string parsing)
+                if window_start_dt <= dt <= before_dt:
                     candidates.append(d)
+
             if not candidates:
                 return None
-            return max(candidates, key=lambda d: d.get("ts", ""))
+            # Return the candidate with latest timestamp
+            return max(
+                candidates, key=lambda d: d.get("_dt") or _parse_ts(d.get("ts", ""))
+            )
 
     # ------------------------------------------------------------------
     # Motif extraction
     # ------------------------------------------------------------------
 
-    def extract_motif(self, edges: list[CausalEdge]) -> IncidentMotif:
+    def extract_motif(
+        self,
+        edges: list[CausalEdge],
+        resolver: IdentityResolver,
+    ) -> IncidentMotif:
         """
-        Convert causal chain to topology-independent behavioral fingerprint.
-        Replaces canonical_ids with role labels based on relation type.
+        Convert causal chain to a topology-independent behavioral fingerprint.
+        causal_shape uses (src_canonical_role, relation, dst_canonical_role) triples
+        from IdentityResolver — stable across service renames.
         """
         motif = IncidentMotif()
-        motif.canonical_ids = list({e.src_cid for e in edges} | {e.dst_cid for e in edges})
+        motif.canonical_ids = list(
+            {e.src_cid for e in edges} | {e.dst_cid for e in edges}
+        )
 
-        # Build abstract event sequence from relation types
-        seen_relations: list[str] = []
-        for edge in edges:
-            role = _relation_to_role(edge.relation)
-            if role not in seen_relations:
-                seen_relations.append(role)
-        motif.event_sequence = seen_relations
-
-        # Build causal shape as (src_role, dst_role) pairs
         motif.causal_shape = [
-            (_relation_to_role(e.relation) + "_SRC", _relation_to_role(e.relation) + "_DST")
+            (
+                resolver.canonical_role(e.src_cid),
+                e.relation,
+                resolver.canonical_role(e.dst_cid),
+            )
             for e in edges
         ]
+
+        seen_roles: list[str] = []
+        for src_role, _rel, dst_role in motif.causal_shape:
+            for role in (src_role, dst_role):
+                if role not in seen_roles:
+                    seen_roles.append(role)
+        motif.event_sequence = seen_roles
 
         motif.confidence = (
             sum(e.confidence for e in edges) / len(edges) if edges else 0.0
@@ -409,19 +460,23 @@ class OperationalGraph:
     # ------------------------------------------------------------------
 
     def apply_decay(self, now_ts: str) -> None:
-        """Decay edge confidence based on staleness. Called lazily."""
-        try:
-            now = _parse_ts(now_ts)
-        except Exception:
-            return
-
+        """Exponential decay: multiply edge confidence by 0.99 per 24h elapsed."""
         with self._lock:
             for _, _, data in self.G.edges(data=True):
                 try:
-                    last = _parse_ts(data.get("last_seen", now_ts))
-                    days_old = (now - last).days
-                    if days_old > 0:
-                        data["confidence"] = max(0.1, data["confidence"] - 0.01 * days_old)
+                    ref_ts = (
+                        data.get("confidence_decay_at")
+                        or data.get("last_seen")
+                        or data.get("first_seen", "")
+                    )
+                    periods = _periods_24h_since(ref_ts, now_ts)
+                    if periods <= 0:
+                        continue
+                    old_conf = float(data.get("confidence", 0.0))
+                    data["confidence"] = max(
+                        0.1, old_conf * (DECAY_FACTOR_PER_24H**periods)
+                    )
+                    data["confidence_decay_at"] = now_ts
                 except Exception:
                     pass
 
@@ -436,7 +491,9 @@ class OperationalGraph:
                 "num_nodes": self.G.number_of_nodes(),
                 "num_edges": self.G.number_of_edges(),
                 "num_deploys": sum(len(v) for v in self._deploy_tracker.values()),
-                "num_remediations": sum(len(v) for v in self._remediation_table.values()),
+                "num_remediations": sum(
+                    len(v) for v in self._remediation_table.values()
+                ),
                 "avg_confidence": (
                     sum(d.get("confidence", 0) for _, _, d in self.G.edges(data=True))
                     / max(1, self.G.number_of_edges())
@@ -501,7 +558,9 @@ class OperationalGraph:
                 visited.add(current_cid)
 
                 if not self.G.has_node(current_cid):
-                    causal_g.add_node(current_cid, is_root=(current_cid == incident_cid))
+                    causal_g.add_node(
+                        current_cid, is_root=(current_cid == incident_cid)
+                    )
                     continue
 
                 causal_g.add_node(current_cid, is_root=(current_cid == incident_cid))
@@ -580,7 +639,8 @@ class OperationalGraph:
         if not source_nodes:
             # If no pure source, use nodes with minimal in-degree
             source_nodes = [
-                n for n in causal_g.nodes()
+                n
+                for n in causal_g.nodes()
                 if causal_g.in_degree(n) <= 1 and n != incident_cid
             ]
 
@@ -605,7 +665,9 @@ class OperationalGraph:
                 all_evidence.extend(edge_data.get("evidence_ids", []))
 
                 first_seen = edge_data.get("first_seen", "")
-                if first_seen and (earliest_time is None or _is_before(first_seen, earliest_time)):
+                if first_seen and (
+                    earliest_time is None or _is_before(first_seen, earliest_time)
+                ):
                     earliest_time = first_seen
 
             # For the source node itself, check if it has early deploy/event timestamp
@@ -613,28 +675,31 @@ class OperationalGraph:
                 deploys = self._deploy_tracker[source_cid]
                 if deploys:
                     deploy_time = deploys[-1].get("ts", "")
-                    if deploy_time and (earliest_time is None or _is_before(deploy_time, earliest_time)):
+                    if deploy_time and (
+                        earliest_time is None or _is_before(deploy_time, earliest_time)
+                    ):
                         earliest_time = deploy_time
 
             avg_confidence = (
                 sum(edge_confidences) / len(edge_confidences)
-                if edge_confidences else 0.0
+                if edge_confidences
+                else 0.0
             )
 
-            root_causes.append({
-                "cid": source_cid,
-                "confidence": round(avg_confidence, 3),
-                "evidence_count": len(set(all_evidence)),
-                "earliest_time": earliest_time or "",
-                "path_length": len(path) - 1,
-                "causal_chain": path,  # Full path including source and incident
-                "intermediate_nodes": path[1:-1] if len(path) > 2 else [],
-            })
+            root_causes.append(
+                {
+                    "cid": source_cid,
+                    "confidence": round(avg_confidence, 3),
+                    "evidence_count": len(set(all_evidence)),
+                    "earliest_time": earliest_time or "",
+                    "path_length": len(path) - 1,
+                    "causal_chain": path,  # Full path including source and incident
+                    "intermediate_nodes": path[1:-1] if len(path) > 2 else [],
+                }
+            )
 
         # Sort by confidence (descending) and path_length (ascending)
-        root_causes.sort(
-            key=lambda x: (-x["confidence"], x["path_length"])
-        )
+        root_causes.sort(key=lambda x: (-x["confidence"], x["path_length"]))
 
         return root_causes
 
@@ -682,8 +747,12 @@ class OperationalGraph:
             )
 
         # Compare degree distributions (topology fingerprint)
-        g1_degrees = sorted([d for n, d in g1.in_degree()] + [d for n, d in g1.out_degree()])
-        g2_degrees = sorted([d for n, d in g2.in_degree()] + [d for n, d in g2.out_degree()])
+        g1_degrees = sorted(
+            [d for n, d in g1.in_degree()] + [d for n, d in g1.out_degree()]
+        )
+        g2_degrees = sorted(
+            [d for n, d in g2.in_degree()] + [d for n, d in g2.out_degree()]
+        )
 
         degree_similarity = 1.0
         if g1_degrees and g2_degrees:
@@ -717,10 +786,10 @@ class OperationalGraph:
         # Combined similarity: weighted average
         # Node and edge topology are most important
         similarity = (
-            0.35 * node_ratio +
-            0.35 * edge_ratio +
-            0.20 * degree_similarity +
-            0.10 * relation_similarity
+            0.35 * node_ratio
+            + 0.35 * edge_ratio
+            + 0.20 * degree_similarity
+            + 0.10 * relation_similarity
         )
 
         return round(min(1.0, max(0.0, similarity)), 3)
@@ -729,6 +798,7 @@ class OperationalGraph:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
 
 def _relation_to_role(relation: str) -> str:
     """Map a relation string to an abstract role label."""
