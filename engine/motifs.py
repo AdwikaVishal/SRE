@@ -208,10 +208,14 @@ class BehavioralMotifIndex:
             if not self._motifs:
                 return []
 
+            role_mapper = BehavioralRoleMapper()
             scored: list[tuple[float, StoredMotif, str, float]] = []
             for stored in self._motifs:
                 # Compute base similarity
-                score, rationale = _compute_similarity(query_motif, stored.motif)
+                base_score, rationale = _compute_similarity(query_motif, stored.motif)
+                role_score = _role_similarity(query_motif, stored.motif, role_mapper)
+                # Blend role fingerprinting (topology-independent) with existing motif signals
+                score = 0.60 * role_score + 0.40 * base_score
 
                 # Rank by structural similarity; pattern confidence is metadata only
                 scored.append((score, stored, rationale, stored.confidence))
@@ -345,6 +349,51 @@ def _jaccard(a: list | set, b: list | set) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
+
+
+class BehavioralRoleMapper:
+    """Map motif/event hints to abstract behavioral roles."""
+
+    def __init__(self) -> None:
+        self.keyword_map = {
+            "timeout": "ROLE:TIMEOUT_CALLER",
+            "latency": "ROLE:LATENCY_PROVIDER",
+            "error_rate": "ROLE:ERROR_RATE_SOURCE",
+            "error": "ROLE:ERROR_SOURCE",
+            "rollback": "ROLE:DEPLOY_ROLLBACK",
+            "deploy": "ROLE:DEPLOY_TRIGGER",
+            "remediation": "ROLE:REMEDIATION_ACTION",
+            "trace": "ROLE:CALL_CHAIN",
+            "incident_signal": "ROLE:ALERT_TRIGGER",
+        }
+
+    def role_of_token(self, token: str) -> str:
+        t = (token or "").lower()
+        for k, role in self.keyword_map.items():
+            if k in t:
+                return role
+        return "ROLE:OTHER"
+
+    def fingerprint_motif(self, motif: IncidentMotif) -> tuple[str, ...]:
+        roles = [self.role_of_token(kind) for kind in motif.event_sequence]
+        for token in motif.content_tokens:
+            roles.append(self.role_of_token(token))
+
+        compressed: list[str] = []
+        for role in roles:
+            if not compressed or compressed[-1] != role:
+                compressed.append(role)
+        return tuple(compressed)
+
+
+def _role_similarity(
+    query: IncidentMotif, stored: IncidentMotif, mapper: BehavioralRoleMapper
+) -> float:
+    q_fp = mapper.fingerprint_motif(query)
+    s_fp = mapper.fingerprint_motif(stored)
+    if not q_fp or not s_fp:
+        return 0.0
+    return _jaccard(set(q_fp), set(s_fp))
 
 
 def _compute_similarity(

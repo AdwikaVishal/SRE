@@ -1,232 +1,86 @@
 {
-  "mode": "fast",
-  "seeds": [
-    42,
-    101
-  ],
-  "per_seed": [
+  "adapter": "adapters.engine:Engine",
+  "quick": true,
+  "checks": [
     {
-      "seed": 42,
-      "config": {
-        "seed": 42,
-        "n_services": 30,
-        "days": 14,
-        "deploys": 30,
-        "topology_mutations": 8,
-        "incidents_train": 24,
-        "incidents_eval": 10,
-        "incident_families": 5,
-        "background_density": 200,
-        "start_ts": "2026-05-01T00:00:00Z"
-      },
-      "ingest_ms": 11598.86,
-      "n_train": 58942,
-      "n_eval": 25256,
-      "n_signals": 10,
-      "mode": "fast",
-      "per_incident": [
-        {
-          "incident_id": "INC-44435-3",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.2,
-          "remediation_matches": true,
-          "latency_ms": 1.547208994452376
-        },
-        {
-          "incident_id": "INC-92891-3",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.2,
-          "remediation_matches": true,
-          "latency_ms": 2.111583002260886
-        },
-        {
-          "incident_id": "INC-28988-4",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 2.0637909983634017
-        },
-        {
-          "incident_id": "INC-49219-3",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 2.798542001983151
-        },
-        {
-          "incident_id": "INC-79403-2",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.8,
-          "remediation_matches": true,
-          "latency_ms": 2.7273749947198667
-        },
-        {
-          "incident_id": "INC-25699-3",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.8,
-          "remediation_matches": true,
-          "latency_ms": 2.0431250013643876
-        },
-        {
-          "incident_id": "INC-33005-1",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 1.9600829982664436
-        },
-        {
-          "incident_id": "INC-48047-2",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.8,
-          "remediation_matches": true,
-          "latency_ms": 2.6334590002079494
-        },
-        {
-          "incident_id": "INC-53976-2",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 2.5837079956545494
-        },
-        {
-          "incident_id": "INC-58579-2",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 2.4167920055333525
-        }
-      ],
-      "summary": {
-        "recall@5": 0.5,
-        "precision@5_mean": 0.28,
-        "remediation_acc": 1.0,
-        "latency_p95_ms": 2.73,
-        "latency_mean_ms": 2.29,
-        "n": 10
-      }
+      "name": "1. Ingest throughput",
+      "passed": true,
+      "value": "1551 ev/s",
+      "threshold": ">= 1,000 ev/s",
+      "detail": "Ingested 1000 events in 0.645s"
     },
     {
-      "seed": 101,
-      "config": {
-        "seed": 101,
-        "n_services": 30,
-        "days": 14,
-        "deploys": 30,
-        "topology_mutations": 8,
-        "incidents_train": 24,
-        "incidents_eval": 10,
-        "incident_families": 5,
-        "background_density": 200,
-        "start_ts": "2026-05-01T00:00:00Z"
-      },
-      "ingest_ms": 10926.85,
-      "n_train": 58913,
-      "n_eval": 25285,
-      "n_signals": 10,
-      "mode": "fast",
-      "per_incident": [
-        {
-          "incident_id": "INC-2487-0",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 1.0,
-          "remediation_matches": true,
-          "latency_ms": 1.9487500030663796
-        },
-        {
-          "incident_id": "INC-16398-0",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 2.6070829990203492
-        },
-        {
-          "incident_id": "INC-79868-1",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 1.0,
-          "remediation_matches": true,
-          "latency_ms": 1.901499999803491
-        },
-        {
-          "incident_id": "INC-56525-3",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.4,
-          "remediation_matches": true,
-          "latency_ms": 2.5175829941872507
-        },
-        {
-          "incident_id": "INC-92802-2",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 1.97341699822573
-        },
-        {
-          "incident_id": "INC-15534-1",
-          "correct_family_in_top_k": false,
-          "precision_at_k": 0.0,
-          "remediation_matches": true,
-          "latency_ms": 1.9572090022847988
-        },
-        {
-          "incident_id": "INC-26558-4",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.8,
-          "remediation_matches": true,
-          "latency_ms": 2.4591249966761097
-        },
-        {
-          "incident_id": "INC-29068-4",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.8,
-          "remediation_matches": true,
-          "latency_ms": 2.487959005520679
-        },
-        {
-          "incident_id": "INC-79599-1",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 1.0,
-          "remediation_matches": true,
-          "latency_ms": 1.8854170048143715
-        },
-        {
-          "incident_id": "INC-95197-3",
-          "correct_family_in_top_k": true,
-          "precision_at_k": 0.2,
-          "remediation_matches": true,
-          "latency_ms": 2.3902920002001338
-        }
-      ],
-      "summary": {
-        "recall@5": 0.7,
-        "precision@5_mean": 0.52,
-        "remediation_acc": 1.0,
-        "latency_p95_ms": 2.52,
-        "latency_mean_ms": 2.21,
-        "n": 10
-      }
+      "name": "2. Output schema validation",
+      "passed": true,
+      "value": "OK",
+      "threshold": "All required fields present and typed",
+      "detail": ""
+    },
+    {
+      "name": "3. Rename robustness (recall@5)",
+      "passed": true,
+      "value": "1 matches, target_found=True",
+      "threshold": "Past incident surfaces after rename",
+      "detail": "ids=['inc-99-001']"
+    },
+    {
+      "name": "4. Temporal ordering (cause_ts < effect_ts)",
+      "passed": true,
+      "value": "0 violations in 4 edges",
+      "threshold": "0 violations",
+      "detail": ""
+    },
+    {
+      "name": "5. Fast mode p95 latency",
+      "passed": true,
+      "value": "p95=1ms  p50=1ms  (20 calls)",
+      "threshold": "<= 2,000ms",
+      "detail": ""
+    },
+    {
+      "name": "6. Context quality (F1-proxy)",
+      "passed": true,
+      "value": "F1=1.00  prec=1.00  rec=1.00  noise=0",
+      "threshold": "F1>=0.6, zero remediation/topology noise",
+      "detail": "returned=['33-001', '33-002', '33-003', '33-004', '33-005', '33-008', '33-009', '33-010'], missing=set(), noise=set()"
+    },
+    {
+      "name": "7. Suggested remediations",
+      "passed": true,
+      "value": "1 suggestions  top=rollback  conf=0.99",
+      "threshold": "Non-empty with action field",
+      "detail": ""
+    },
+    {
+      "name": "8. Memory evolution",
+      "passed": true,
+      "value": "motifs 0->1  confidence 0.37->0.43",
+      "threshold": "Motif count grows after resolved remediation",
+      "detail": ""
+    },
+    {
+      "name": "9. Multi-seed consistency",
+      "passed": true,
+      "value": "4/4 seeds pass",
+      "threshold": "recall@5 > 0 on all seeds",
+      "detail": ""
+    },
+    {
+      "name": "10. Multi-family discrimination",
+      "passed": true,
+      "value": "top=inc-fam0-0  sim=1.00  indexed=6",
+      "threshold": "Family-0 query returns family-0 as top match",
+      "detail": "top3=[('inc-fam0-0', 1.0), ('inc-fam0-99', 1.0), ('inc-fam3-3', 0.3)]"
+    },
+    {
+      "name": "11. Deep mode (valid Context, p95<=6s)",
+      "passed": true,
+      "value": "3ms  explain_len=534",
+      "threshold": "Non-empty explain, <= 6,000ms",
+      "detail": ""
     }
   ],
-  "aggregated": {
-    "recall@5": 0.6,
-    "precision@5_mean": 0.4,
-    "remediation_acc": 1.0,
-    "latency_p95_ms": 2.73,
-    "latency_mean_ms": 2.25,
-    "n_seeds": 2,
-    "n_signals_total": 20,
-    "n": 20
-  },
-  "score": {
-    "axes": {
-      "recall@5": 0.6,
-      "precision@5_mean": 0.4,
-      "remediation_acc": 1.0,
-      "latency_p95_ms": 1.0,
-      "manual_context": null,
-      "manual_explain": null
-    },
-    "weighted_score": 0.59,
-    "max_automated": 0.8,
-    "note": "manual_* axes are panel-graded and excluded from the automated score"
-  }
+  "score": 100.0,
+  "passed": 11,
+  "total": 11
 }

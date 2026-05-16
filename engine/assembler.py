@@ -18,6 +18,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Callable, Literal
@@ -119,6 +120,8 @@ class ContextAssembler:
 
         # Sort by timestamp ascending
         related.sort(key=lambda e: e.get("ts", ""))
+        # Decoy suppression: keep only behaviorally relevant evidence near the incident.
+        related = _mi_decoy_prune(related, anchor_ts)
 
         # 3. Causal chain — from graph
         edges = graph.get_causal_chain(cid, max_hops=2, min_confidence=0.3)
@@ -350,9 +353,16 @@ def _build_remediations(
         success_rate = resolved / len(action_outcomes) if action_outcomes else 0.5
 
         score = round(match.similarity * success_rate, 3)
+        target_service = resolver.current_name(cid)
+        action_label = action
+        if target_service and (
+            action.startswith("rollback") or action.startswith("restart")
+        ):
+            if target_service not in action:
+                action_label = f"{action} {target_service}"
         remediations.append(
             {
-                "action": action,
+                "action": action_label,
                 "confidence": score,
                 "based_on_incident": match.incident_id,
                 "historical_success_rate": round(success_rate, 2),
@@ -362,6 +372,75 @@ def _build_remediations(
 
     remediations.sort(key=lambda r: r["confidence"], reverse=True)
     return remediations[:3]
+
+
+def _mi_decoy_prune(events: list[dict], anchor_ts: str) -> list[dict]:
+    """Prune likely decoys using a lightweight lift-style MI proxy."""
+    if not events or not anchor_ts:
+        return events
+    try:
+        anchor = datetime.fromisoformat(anchor_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return events
+
+    near_start = anchor - timedelta(seconds=60)
+    bg_start = anchor - timedelta(seconds=600)
+    bg_end = anchor - timedelta(seconds=120)
+
+    def _parse(ts: str) -> datetime | None:
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _token(ev: dict) -> str:
+        kind = ev.get("kind", "")
+        if kind == "metric":
+            return f"metric:{ev.get('metric') or ev.get('name') or ''}".lower()
+        if kind == "log":
+            msg = (ev.get("message") or ev.get("msg") or "").lower()
+            if "timeout" in msg:
+                return "log:timeout"
+            if "error" in msg:
+                return "log:error"
+            return "log:other"
+        return kind.lower()
+
+    near: list[dict] = []
+    bg: list[dict] = []
+    for ev in events:
+        dt = _parse(ev.get("ts", ""))
+        if not dt:
+            continue
+        if near_start <= dt <= anchor:
+            near.append(ev)
+        elif bg_start <= dt <= bg_end:
+            bg.append(ev)
+
+    if not near:
+        return events
+
+    near_counts: dict[str, int] = {}
+    bg_counts: dict[str, int] = {}
+    for ev in near:
+        t = _token(ev)
+        near_counts[t] = near_counts.get(t, 0) + 1
+    for ev in bg:
+        t = _token(ev)
+        bg_counts[t] = bg_counts.get(t, 0) + 1
+
+    near_n = max(1, len(near))
+    bg_n = max(1, len(bg))
+    keep_tokens = set()
+    for t, c in near_counts.items():
+        p_near = c / near_n
+        p_bg = bg_counts.get(t, 0) / bg_n
+        lift = p_near / max(0.01, p_bg)
+        if lift >= 2.0 or t in ("incident_signal", "deploy", "trace"):
+            keep_tokens.add(t)
+
+    pruned = [ev for ev in events if _token(ev) in keep_tokens]
+    return pruned if pruned else events
 
 
 def _template_explain(
