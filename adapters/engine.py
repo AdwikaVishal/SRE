@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 from engine.assembler import ContextAssembler
+from engine.correlation import CorrelationAnalyzer
 from engine.graph import OperationalGraph
 from engine.identity import IdentityResolver
 from engine.motifs import BehavioralMotifIndex
@@ -41,9 +42,21 @@ class Engine:
         self.graph = OperationalGraph()  # NetworkX DiGraph
         self.motifs = BehavioralMotifIndex()
         self.assembler = ContextAssembler()
+        self.correlation_analyzer = CorrelationAnalyzer(
+            event_store=self.store,
+            window_seconds=60,
+            min_incident_count=5,
+            significance_level=0.05,
+        )
         self._lock = threading.Lock()
         self._open_incidents: dict[str, dict] = {}
         self._persistence_dir = persistence_dir or os.environ.get("ANVIL_STATE_DIR")
+
+        # Service alias tracking for rename-robust retrieval
+        self.alias_map = {}  # current_name -> canonical_id (mirrors resolver)
+        self.reverse_alias = {}  # canonical_id -> {all known names}
+        self.canonical_counter = 0  # For internal alias tracking if needed
+
         self._load_persisted_state()
 
     # ------------------------------------------------------------------
@@ -220,6 +233,8 @@ class Engine:
                 new_name = event.get("to", "")
                 if old_name and new_name:
                     self.resolver.rename(old_name, new_name, ts)
+                    # Track alias mapping for rename-robust incident similarity
+                    self._merge_aliases(old_name, new_name)
             elif change_kind in ("dep_add", "dep_remove", "dependency"):
                 self.resolver.resolve(event.get("src", event.get("source", "")) or "")
                 self.resolver.resolve(event.get("dst", event.get("target", "")) or "")
@@ -245,6 +260,8 @@ class Engine:
                 new_name = event.get("new_name", event.get("to", ""))
             if old_name and new_name:
                 self.resolver.rename(old_name, new_name, ts)
+                # Track alias mapping for rename-robust incident similarity
+                self._merge_aliases(old_name, new_name)
         elif kind in ("dep_add", "dep_remove", "dependency"):
             if isinstance(mutation, dict):
                 src = mutation.get("src", mutation.get("source", ""))
@@ -268,6 +285,65 @@ class Engine:
             kind="topology",
             raw=event,
             trace_id=None,
+        )
+
+    def _merge_aliases(self, old_name: str, new_name: str) -> None:
+        """Track service name aliases for rename-robust incident similarity.
+
+        Synchronizes with IdentityResolver's canonical IDs to ensure that
+        incident fingerprints use canonical identifiers rather than surface names.
+        """
+        # Get canonical IDs via resolver (resolver.rename should have been called first)
+        old_cid = self.resolver.resolve(old_name)
+        new_cid = self.resolver.resolve(new_name)
+
+        # After resolver.rename(), both should resolve to the same canonical ID
+        if old_cid == new_cid:
+            # Happy path: resolver already merged them
+            cid = old_cid
+            # Update our alias map
+            self.alias_map[old_name] = cid
+            self.alias_map[new_name] = cid
+            # Update reverse mapping (canonical_id -> all names)
+            if cid not in self.reverse_alias:
+                self.reverse_alias[cid] = set()
+            self.reverse_alias[old_cid].add(old_name)
+            self.reverse_alias[old_cid].add(new_name)
+
+    def _canonical_fingerprint(self, incident_events: list) -> tuple:
+        """Replace service names with canonical IDs before fingerprinting.
+
+        This ensures that incident similarity matching is robust to service renames.
+        Two incidents that occur on the same logical service (under different names)
+        will have identical fingerprints.
+        """
+        fingerprint = []
+        for ev in incident_events:
+            # Handle both dict and object-style events
+            if isinstance(ev, dict):
+                svc = ev.get("service")
+                kind = ev.get("kind")
+                msg = ev.get("msg") or ev.get("message", "")
+            else:
+                svc = getattr(ev, "service", None)
+                kind = getattr(ev, "kind", None)
+                msg = getattr(ev, "msg", getattr(ev, "message", ""))
+
+            # Resolve service name to canonical ID
+            if svc:
+                cid = self.alias_map.get(svc) or self.resolver.resolve(svc)
+            else:
+                cid = None
+
+            # Truncate message to 50 chars for fingerprinting
+            msg_snippet = msg[:50] if msg else ""
+
+            fingerprint.append((cid, kind, msg_snippet))
+
+        # Sort for deterministic comparison, handling None values
+        # Convert None to empty string for sorting purposes
+        return tuple(
+            sorted(fingerprint, key=lambda x: (x[0] or "", x[1] or "", x[2] or ""))
         )
 
     def _process_event(self, event: dict) -> None:
